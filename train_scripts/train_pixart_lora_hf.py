@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Fine-tuning script for Stable Diffusion for text2image with support for LoRA."""
+# add /kuacc/users/icetin24/super-resolution-work/S3Diff/src to the path
 
 import argparse
 import logging
@@ -26,6 +27,7 @@ from typing import List, Union
 import datasets
 import numpy as np
 import torch
+from torch import nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -49,6 +51,11 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 
+
+from omegaconf import OmegaConf
+import sys
+sys.path.append('/kuacc/users/icetin24/super-resolution-work/S3Diff/src')
+from my_utils.training_utils import parse_args_paired_training, PairedDataset, degradation_proc
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.25.0.dev0")
 
@@ -119,6 +126,12 @@ These are LoRA adaption weights for {base_model}. The weights were fine-tuned on
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
+        "--train_sr",
+        action="store_true",
+        help="Whether to train the model for super resolution. If not set, the model is trained for image generation.",
+        default=False,
+    )
+    parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
@@ -175,6 +188,9 @@ def parse_args():
     )
     parser.add_argument(
         "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
+    )
+    parser.add_argument(
+        "--validation_steps", type=int, default=50, help="Number of steps between validation runs."
     )
     parser.add_argument(
         "--num_validation_images",
@@ -433,6 +449,7 @@ DATASET_NAME_MAPPING = {"lambdalabs/pokemon-blip-captions": ("image", "text"),}
 
 
 def main():
+    config = OmegaConf.load('/kuacc/users/icetin24/super-resolution-work/S3Diff/configs/sr.yaml')
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -480,8 +497,6 @@ def main():
     # See Section 3.1. of the paper.
     max_length = 120
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora transformer) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -530,7 +545,7 @@ def main():
         use_dora = args.use_dora,
         use_rslora = args.use_rslora
     )
-
+    
     # Move transformer, vae and text_encoder to device and cast to weight_dtype
     transformer.to(accelerator.device)
     
@@ -622,55 +637,88 @@ def main():
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+    if not args.train_sr:
+        if args.dataset_name is not None:
+            # Downloading and loading a dataset from the hub.
+            dataset = load_dataset(
+                args.dataset_name,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+                data_dir=args.train_data_dir,
             )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+        else:
+            data_files = {}
+            if args.train_data_dir is not None:
+                data_files["train"] = os.path.join(args.train_data_dir, "**")
+            dataset = load_dataset(
+                "imagefolder",
+                data_files=data_files,
+                cache_dir=args.cache_dir,
             )
+        column_names = dataset["train"].column_names
+        dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
+        if args.image_column is None:
+            image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+        else:
+            image_column = args.image_column
+            if image_column not in column_names:
+                raise ValueError(
+                    f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+                )
+        if args.caption_column is None:
+            caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+        else:
+            caption_column = args.caption_column
+            if caption_column not in column_names:
+                raise ValueError(
+                    f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+                )
+        
+        train_transforms = transforms.Compose(
+            [
+                transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+                transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+        
+        def preprocess_train(examples):
+            images = [image.convert("RGB") for image in examples[image_column]]
+            examples["pixel_values"] = [train_transforms(image) for image in images]
+            examples["input_ids"], examples['prompt_attention_mask'] = tokenize_captions(examples, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length)
+            return examples
+        
+        def collate_fn(examples):
+            pixel_values = torch.stack([example["pixel_values"] for example in examples])
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            input_ids = torch.stack([example["input_ids"] for example in examples])
+            prompt_attention_mask = torch.stack([example["prompt_attention_mask"] for example in examples])
+            return {"pixel_values": pixel_values, "input_ids": input_ids, 'prompt_attention_mask': prompt_attention_mask}
+        
+        with accelerator.main_process_first():
+            if args.max_train_samples is not None:
+                dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            # Set the training transforms
+            train_dataset = dataset["train"].with_transform(preprocess_train)
 
+        # DataLoaders creation:
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            shuffle=True,
+            collate_fn=collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
+    
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True, proportion_empty_prompts=0., max_length=120):
@@ -691,45 +739,14 @@ def main():
         return inputs.input_ids, inputs.attention_mask
 
     # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"], examples['prompt_attention_mask'] = tokenize_captions(examples, proportion_empty_prompts=args.proportion_empty_prompts, max_length=max_length)
-        return examples
-
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        prompt_attention_mask = torch.stack([example["prompt_attention_mask"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids, 'prompt_attention_mask': prompt_attention_mask}
-
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
-
-    # Scheduler and math around the number of training steps.
+    
+    # burası generic
+    if args.train_sr:
+        train_dataset = PairedDataset(config.train)
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
+        val_dataset = PairedDataset(config.validation)
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
+        
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -757,7 +774,44 @@ def main():
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+    
+    # evaluate on start 
+    if args.validation_prompt is not None:
+        logger.info(
+            f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+            f" {args.validation_prompt}."
+        )
+        # create pipeline
+        pipeline = DiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            transformer=accelerator.unwrap_model(transformer, keep_fp32_wrapper=False),
+            text_encoder=text_encoder, vae=vae,
+            torch_dtype=weight_dtype,
+        )
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.set_progress_bar_config(disable=True)
 
+        # run inference
+        generator = torch.Generator(device=accelerator.device)
+        if args.seed is not None:
+            generator = generator.manual_seed(args.seed)
+        images = []
+        for _ in range(args.num_validation_images):
+            images.append(pipeline(args.validation_prompt, num_inference_steps=20, generator=generator).images[0])
+
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+            if tracker.name == "wandb":
+                tracker.log(
+                    {
+                        "validation": [wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)]
+                    }
+                )
+
+        del pipeline
+        torch.cuda.empty_cache()
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -805,15 +859,28 @@ def main():
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
+    
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            lr_latents = None
             with accelerator.accumulate(transformer):
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                # batch contain LR (HR // 4), HR and original LR
+                if args.train_sr:
+                    x_src, x_tgt, x_ori_size_src = degradation_proc(config, batch, accelerator.device) # LQ (HR // 4), HR, LQ original size
+                    B, C, H, W = x_src.shape
+                    hr_latents = vae.encode(x_tgt.to(dtype=weight_dtype)).latent_dist.sample()
+                    lr_latents = vae.encode(x_src.to(dtype=weight_dtype)).latent_dist.sample()
+                    lr_latents = lr_latents * vae.config.scaling_factor
+                    
+                    # use nn.Linear and project the lr_latents to the same size as prompt_embeds
+                    # lr_latents = nn.Linear(lr_latents.shape[1], prompt_embeds.shape[2])(lr_latents) 
+                    latents = hr_latents * vae.config.scaling_factor
+                
+                else:
+                    latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -821,18 +888,27 @@ def main():
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn((latents.shape[0], latents.shape[1], 1, 1), device=latents.device)
 
-                bsz = latents.shape[0]
+                batch_size = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
-                prompt_embeds = text_encoder(batch["input_ids"], attention_mask=batch['prompt_attention_mask'])[0]
-                prompt_attention_mask = batch['prompt_attention_mask']
+                # Get the text embedding for conditioning (text embeddings is None for now)
+                if not args.train_sr:
+                    prompt_embeds = text_encoder(batch["input_ids"], attention_mask=batch['prompt_attention_mask'])[0]
+                    prompt_attention_mask = batch['prompt_attention_mask']
+                else:
+                    prompt_attention_mask = torch.zeros((batch_size, max_length), device=latents.device)
+                    captions = ["" for _ in range(batch_size)]
+                    input_ids = tokenizer(captions, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids
+                    input_ids = input_ids.to(device=latents.device)
+                    prompt_embeds = text_encoder(input_ids, attention_mask=prompt_attention_mask)[0]
+                    prompt_attention_mask = prompt_attention_mask.to(dtype=weight_dtype, device=latents.device)
+                    prompt_embeds = prompt_embeds.to(dtype=weight_dtype, device=latents.device)
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
                     # set prediction_type of scheduler if defined
@@ -848,16 +924,18 @@ def main():
                 # Prepare micro-conditions.
                 added_cond_kwargs = {"resolution": None, "aspect_ratio": None}
                 if getattr(transformer, 'module', transformer).config.sample_size == 128:
-                    resolution = torch.tensor([args.resolution, args.resolution]).repeat(bsz, 1)
-                    aspect_ratio = torch.tensor([float(args.resolution / args.resolution)]).repeat(bsz, 1)
+                    resolution = torch.tensor([args.resolution, args.resolution]).repeat(batch_size, 1)
+                    aspect_ratio = torch.tensor([float(args.resolution / args.resolution)]).repeat(batch_size, 1)
                     resolution = resolution.to(dtype=weight_dtype, device=latents.device)
                     aspect_ratio = aspect_ratio.to(dtype=weight_dtype, device=latents.device)
                     added_cond_kwargs = {"resolution": resolution, "aspect_ratio": aspect_ratio}
-
+                
                 # Predict the noise residual and compute loss
+                # transformer girdisine göre model_pred ayarla
                 model_pred = transformer(noisy_latents,
-                                         encoder_hidden_states=prompt_embeds,
-                                         encoder_attention_mask=prompt_attention_mask,
+                                         lr_latents=lr_latents,
+                                         encoder_hidden_states=prompt_embeds, # None
+                                         encoder_attention_mask=prompt_attention_mask, # None
                                          timestep=timesteps,
                                          added_cond_kwargs=added_cond_kwargs).sample.chunk(2, 1)[0]
 
@@ -876,7 +954,7 @@ def main():
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
-
+                
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
@@ -889,8 +967,7 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
+            
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
@@ -930,50 +1007,83 @@ def main():
                         )
 
                         logger.info(f"Saved state to {save_path}")
+            if accelerator.is_main_process:
+                if args.validation_prompt is not None and global_step % args.validation_steps == 0 and not args.train_sr:
+                    logger.info(
+                        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+                        f" {args.validation_prompt}."
+                    )
+                    # create pipeline
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        transformer=accelerator.unwrap_model(transformer, keep_fp32_wrapper=False),
+                        text_encoder=text_encoder, vae=vae,
+                        torch_dtype=weight_dtype,
+                    )
+                    pipeline = pipeline.to(accelerator.device)
+                    pipeline.set_progress_bar_config(disable=True)
+
+                    # run inference
+                    generator = torch.Generator(device=accelerator.device)
+                    if args.seed is not None:
+                        generator = generator.manual_seed(torch.randint(0, 1000000, (1,)).item())
+                    images = []
+                    for _ in range(args.num_validation_images):
+                        images.append(pipeline(args.validation_prompt, num_inference_steps=20, generator=generator).images[0])
+
+                    for tracker in accelerator.trackers:
+                        if tracker.name == "tensorboard":
+                            np_images = np.stack([np.asarray(img) for img in images])
+                            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                        if tracker.name == "wandb":
+                            tracker.log(
+                                {
+                                    "validation": [wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)]
+                                }
+                            )
+
+                    del pipeline
+                    torch.cuda.empty_cache()
+        
+                elif args.train_sr and global_step % args.validation_steps == 0:
+                    logger.info(
+                        f"Running super-resolution validation... \n Generating {args.num_validation_images} images with prompt:"
+                    )
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        transformer=accelerator.unwrap_model(transformer, keep_fp32_wrapper=False),
+                        text_encoder=text_encoder, vae=vae,
+                        torch_dtype=weight_dtype,
+                    )
+                    pipeline = pipeline.to(accelerator.device)
+                    pipeline.set_progress_bar_config(disable=True)
+                    # run inference
+                    generator = torch.Generator(device=accelerator.device)
+                    if args.seed is not None:
+                        generator = generator.manual_seed(args.seed)
+                    images = []
+                    for _ in range(args.num_validation_images):
+                        images.append(pipeline(args.validation_prompt, num_inference_steps=20, generator=generator).images[0])
+
+                    for tracker in accelerator.trackers:
+                        if tracker.name == "tensorboard":
+                            np_images = np.stack([np.asarray(img) for img in images])
+                            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                        if tracker.name == "wandb":
+                            tracker.log(
+                                {
+                                    "validation": [wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)]
+                                }
+                            )
+
+                    del pipeline
+                    torch.cuda.empty_cache()
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
-
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                    f" {args.validation_prompt}."
-                )
-                # create pipeline
-                pipeline = DiffusionPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    transformer=accelerator.unwrap_model(transformer, keep_fp32_wrapper=False),
-                    text_encoder=text_encoder, vae=vae,
-                    torch_dtype=weight_dtype,
-                )
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
-
-                # run inference
-                generator = torch.Generator(device=accelerator.device)
-                if args.seed is not None:
-                    generator = generator.manual_seed(args.seed)
-                images = []
-                for _ in range(args.num_validation_images):
-                    images.append(pipeline(args.validation_prompt, num_inference_steps=20, generator=generator).images[0])
-
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "validation": [wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)]
-                            }
-                        )
-
-                del pipeline
-                torch.cuda.empty_cache()
 
     # Save the lora layers
     accelerator.wait_for_everyone()

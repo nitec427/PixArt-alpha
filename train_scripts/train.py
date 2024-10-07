@@ -16,6 +16,10 @@ from diffusers.models import AutoencoderKL
 from mmcv.runner import LogBuffer
 from torch.utils.data import RandomSampler
 
+current_file_path = Path(__file__).resolve()
+sys.path.insert(0, str(current_file_path.parent))
+sys.path.insert(0, str(current_file_path.parent.parent))
+
 from diffusion import IDDPM
 from diffusion.data.builder import build_dataset, build_dataloader, set_data_root
 from diffusion.model.builder import build_model
@@ -29,8 +33,6 @@ from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
 
 warnings.filterwarnings("ignore")  # ignore warning
 
-current_file_path = Path(__file__).resolve()
-sys.path.insert(0, str(current_file_path.parent.parent))
 
 
 def set_fsdp_env():
@@ -57,7 +59,7 @@ def train():
     start_step = start_epoch * len(train_dataloader)
     global_step = 0
     total_steps = len(train_dataloader) * config.num_epochs
-
+    breakpoint()
     load_vae_feat = getattr(train_dataloader.dataset, 'load_vae_feat', False)
     # Now you train the model
     for epoch in range(start_epoch + 1, config.num_epochs + 1):
